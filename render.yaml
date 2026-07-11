@@ -60,3 +60,31 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python external_mcp_server.py
+
+  # Sub-agents for the agent-to-agent leg. The orchestrator delegates to these
+  # through the TrueFoundry MCP gateway, so Reva can authorize one agent calling
+  # another. Register each in TF's MCP Registry under EXACTLY these names.
+  - type: web
+    name: ticketing-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ticketing_agent_server.py
+    envVars:
+      # ticketing-agent reasons by making its OWN model call through TrueFoundry,
+      # so it needs the gateway config + key. Model is the funded Nova.
+      - key: TFY_LLM_URL
+        value: https://reva-demo.truefoundry.cloud/api/llm
+      - key: TFY_MCP_URL
+        value: https://gateway.truefoundry.ai/reva-demo/mcp
+      - key: TFY_MODEL
+        value: bedrock/amazon.nova-micro-v1-0
+      - key: TFY_API_KEY
+        sync: false
+
+  - type: web
+    name: booking-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python booking_agent_server.py

@@ -8,3 +8,5 @@ pydantic>=2.10
 # The MCP servers (billing/external) run on fastmcp; the plugin loads .env via python-dotenv.
 fastmcp>=2.0
 python-dotenv>=1.0
+# ticketing-agent makes its own LLM call through TrueFoundry (gateway.py -> AsyncOpenAI).
+openai>=1.0
