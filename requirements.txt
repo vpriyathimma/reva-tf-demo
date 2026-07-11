@@ -1,0 +1,10 @@
+# Floors, not exact pins — lets prebuilt wheels resolve across Python 3.12
+# (the Docker target) through 3.14. Pin exactly in a lockfile if you need
+# reproducible builds.
+fastapi>=0.115
+uvicorn[standard]>=0.34
+httpx>=0.28
+pydantic>=2.10
+# The MCP servers (billing/external) run on fastmcp; the plugin loads .env via python-dotenv.
+fastmcp>=2.0
+python-dotenv>=1.0

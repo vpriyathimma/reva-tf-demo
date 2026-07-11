@@ -1,0 +1,62 @@
+# Render Blueprint — makes the three demo services permanent so the public URLs
+# stop rotting. One repo, three free web services:
+#
+#   reva-plugin   the Reva guardrail TrueFoundry calls  (/reva/authorize, /healthz)
+#   billing-mcp   the MCP server whose tools the store governs   (/mcp)
+#   external-mcp  the untrusted MCP server the store forbids      (/mcp)
+#
+# Deploy: push this dir to a Git repo -> Render -> New -> Blueprint -> pick the repo.
+# Render reads this file, creates all three, and asks for the four secrets below
+# (marked sync:false). After first deploy, paste the three stable URLs into
+# TrueFoundry (see DEPLOY-RENDER.md).
+#
+# Free plan note: a service sleeps after ~15 min idle and cold-starts (~40s) on the
+# next request. Hit each /healthz once before presenting so the first real call is warm.
+
+services:
+  - type: web
+    name: reva-plugin
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      # --- non-secret config (safe in git; mirrors the working local .env) ---
+      - key: REVA_SCHEMA_MODE
+        value: agent_v5
+      - key: REVA_AGENT_ID
+        value: billing-support-agent
+      - key: REVA_PIN_TO_ENV
+        value: "1"
+      - key: REVA_PDP_ORIGIN
+        value: https://demo.preview.reva.ai
+      - key: REVA_HOOK_MODE
+        value: enforce
+      - key: REVA_PDP_TIMEOUT
+        value: "5.0"
+      - key: REVA_DEBUG
+        value: "0"
+      # --- secrets: Render prompts for these on deploy; never commit them ---
+      - key: REVA_PDP_URL
+        sync: false
+      - key: REVA_POLICYSTORE_ID
+        sync: false
+      - key: REVA_AUTH_TOKEN
+        sync: false
+      - key: TFY_API_KEY
+        sync: false
+
+  - type: web
+    name: billing-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python billing_mcp_server.py
+
+  - type: web
+    name: external-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python external_mcp_server.py
