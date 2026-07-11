@@ -1,7 +1,7 @@
 # Render Blueprint — makes the three demo services permanent so the public URLs
 # stop rotting. One repo, three free web services:
 #
-#   reva-plugin   the Reva guardrail TrueFoundry calls  (/reva/authorize, /healthz)
+#   reva-tf-plugin  the Reva guardrail TrueFoundry calls  (/reva/authorize, /healthz)
 #   billing-mcp   the MCP server whose tools the store governs   (/mcp)
 #   external-mcp  the untrusted MCP server the store forbids      (/mcp)
 #
@@ -15,7 +15,7 @@
 
 services:
   - type: web
-    name: reva-plugin
+    name: reva-tf-plugin
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
