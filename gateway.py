@@ -27,7 +27,11 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-TFY_API_KEY = os.environ.get("TFY_API_KEY", "")
+# .strip() defensively: a key pasted into a hosting dashboard often picks up a
+# trailing newline, which makes httpx reject the "Bearer <key>\n" Authorization
+# header with "Illegal header value". Stripping here fixes it at the source for
+# both the LLM client and the MCP client.
+TFY_API_KEY = os.environ.get("TFY_API_KEY", "").strip()
 # The OpenAI-compatible endpoint. Requests here land on /chat/completions in the
 # metrics dashboard and count toward "Total LLM Calls".
 TFY_LLM_URL = os.environ.get("TFY_LLM_URL", "https://reva-demo.truefoundry.cloud/api/llm")
