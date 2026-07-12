@@ -79,16 +79,28 @@ async def chat(
     return await client.chat.completions.create(**kwargs)
 
 
-def _mcp_client(server: str) -> Client:
+def _mcp_client(server: str, *, agent_id: str | None = None, user: str | None = None) -> Client:
+    # Forward the acting agent + on-behalf-of user in X-TFY-METADATA, exactly like
+    # the LLM client does. Without this, TrueFoundry fills the MCP guardrail context
+    # with the API key's owner, so Reva sees the wrong user and on-behalf-of tool
+    # policies (e.g. "bob@intern cannot pull billing reports") never match.
+    headers = {"Authorization": f"Bearer {_require_key()}"}
+    if agent_id or user:
+        meta: dict[str, str] = {}
+        if agent_id:
+            meta["agent_id"] = agent_id
+        if user:
+            meta["reva_user"] = user
+        headers["X-TFY-METADATA"] = json.dumps(meta)
     return Client(
         StreamableHttpTransport(
             url=f"{TFY_MCP_URL}/{server}/server",
-            headers={"Authorization": f"Bearer {_require_key()}"},
+            headers=headers,
         )
     )
 
 
-async def list_tools(server: str) -> list[dict[str, Any]]:
+async def list_tools(server: str, *, agent_id: str | None = None, user: str | None = None) -> list[dict[str, Any]]:
     """Discover a registered MCP server's tools, shaped for the OpenAI tools param.
 
     Tool names are prefixed with the server so the orchestrator can route a
@@ -96,7 +108,7 @@ async def list_tools(server: str) -> list[dict[str, Any]]:
     OpenAI rejects `/` in function names -- and `/` is what Reva's resource ids
     use, so the two conventions have to be translated at this boundary.
     """
-    async with _mcp_client(server) as c:
+    async with _mcp_client(server, agent_id=agent_id, user=user) as c:
         return [
             {
                 "type": "function",
@@ -110,7 +122,8 @@ async def list_tools(server: str) -> list[dict[str, Any]]:
         ]
 
 
-async def call_tool(server: str, tool: str, arguments: dict[str, Any]) -> Any:
+async def call_tool(server: str, tool: str, arguments: dict[str, Any],
+                    *, agent_id: str | None = None, user: str | None = None) -> Any:
     """Invoke one MCP tool through the gateway.
 
     Raises whatever the gateway raises. A Reva denial surfaces here as an
@@ -118,6 +131,6 @@ async def call_tool(server: str, tool: str, arguments: dict[str, Any]) -> Any:
     should catch it and tell the user they were not authorized, rather than
     letting it read as a crash.
     """
-    async with _mcp_client(server) as c:
+    async with _mcp_client(server, agent_id=agent_id, user=user) as c:
         result = await c.call_tool(tool, arguments)
         return result.structured_content or result.content

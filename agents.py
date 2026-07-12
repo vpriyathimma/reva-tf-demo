@@ -51,7 +51,8 @@ def _is_denial(err: Exception) -> bool:
 
 
 async def _available_tools(
-    emit: Callable[[dict], None], servers: list[str] | None = None
+    emit: Callable[[dict], None], servers: list[str] | None = None,
+    *, agent_id: str | None = None, user: str | None = None,
 ) -> list[dict[str, Any]]:
     """Discover tools from each selected server. A server that is down is skipped
     rather than fatal -- the demo should degrade, not collapse.
@@ -63,18 +64,19 @@ async def _available_tools(
     tools: list[dict[str, Any]] = []
     for server in (servers if servers is not None else SERVERS):
         try:
-            tools.extend(await gateway.list_tools(server))
+            tools.extend(await gateway.list_tools(server, agent_id=agent_id, user=user))
         except Exception as e:  # noqa: BLE001
             emit({"type": "warn", "text": f"{server} unreachable: {str(e)[:80]}"})
     return tools
 
 
-async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None]) -> str:
+async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
+                    *, agent_id: str | None = None, user: str | None = None) -> str:
     """Execute one tool call and return what the model should see as its result."""
     server, tool = name.split("__", 1)
     emit({"type": "tool_call", "server": server, "tool": tool, "arguments": arguments})
     try:
-        result = await gateway.call_tool(server, tool, arguments)
+        result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user)
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
             emit({"type": "denied", "server": server, "tool": tool})
@@ -154,14 +156,15 @@ def _fallback_intent(message: str, servers: list[str] | None) -> tuple[str, str,
 
 
 async def _run_fallback(
-    message: str, servers: list[str] | None, emit: Callable[[dict], None]
+    message: str, servers: list[str] | None, emit: Callable[[dict], None],
+    *, agent_id: str | None = None, user: str | None = None,
 ) -> str | None:
     """If the prompt maps to a tool, call it directly and phrase the outcome."""
     intent = _fallback_intent(message, servers)
     if not intent:
         return None
     server, tool, args = intent
-    result = await _run_tool(f"{server}__{tool}", args, emit)
+    result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user)
     return _phrase(f"{server}__{tool}", result)
 
 
@@ -185,7 +188,7 @@ async def orchestrate(
     max_turns bounds the loop: a model that keeps calling denied tools would
     otherwise retry forever, and each retry is a real authorization request.
     """
-    tools = await _available_tools(emit, servers)
+    tools = await _available_tools(emit, servers, agent_id=agent_id, user=user)
     used_model = model or gateway.TFY_MODEL
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM},
@@ -208,7 +211,7 @@ async def orchestrate(
         # produces an invalid tool-use sequence). Show the model as allowed, then
         # fall back to invoking the tool the user clearly wanted.
         emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-        fb = await _run_fallback(message, servers, emit)
+        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
         if fb is not None:
             return fb
         # Nova failed and nothing maps to an enabled tool (e.g. a billing question
@@ -226,7 +229,7 @@ async def orchestrate(
     # Nova answered in prose without calling a tool. If the prompt plainly maps to
     # one, run it anyway so the demo beat still lands; otherwise return the text.
     if not choice.tool_calls:
-        fb = await _run_fallback(message, servers, emit)
+        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
         return fb if fb is not None else (_strip_thinking(choice.content) or "…")
 
     # Nova called the tool itself — run each and report the outcome deterministically
@@ -234,7 +237,8 @@ async def orchestrate(
     replies = [
         _phrase(
             tc.function.name,
-            await _run_tool(tc.function.name, json.loads(tc.function.arguments or "{}"), emit),
+            await _run_tool(tc.function.name, json.loads(tc.function.arguments or "{}"), emit,
+                            agent_id=agent_id, user=user),
         )
         for tc in choice.tool_calls
     ]
