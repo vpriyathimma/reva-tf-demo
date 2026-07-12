@@ -18,6 +18,7 @@ Endpoints (paths are referenced from the TrueFoundry integration form):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -26,10 +27,12 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from dotenv import load_dotenv
 
+import agents
 from entities import InputGuardrailRequest, ValidateGuardrailResponse
 from guardrail.reva_auth import RevaAuthorizer, RevaConfig, _log
 
@@ -39,7 +42,7 @@ from guardrail.reva_auth import RevaAuthorizer, RevaConfig, _log
 load_dotenv(Path(__file__).with_name(".env"))
 
 authorizer = RevaAuthorizer()
-_DEMO_HTML = Path(__file__).with_name("demo.html")
+_STATIC = Path(__file__).with_name("static")
 
 
 def _debug_dump(where: str, payload: dict[str, Any], cfg: RevaConfig) -> None:
@@ -87,14 +90,54 @@ async def _log_validation_error(request: Request, exc: RequestValidationError) -
     return JSONResponse(status_code=200, content={"verdict": True, "message": "debug: payload logged"})
 
 
-@app.get("/", response_class=HTMLResponse)
-async def demo_page() -> str:
-    """Minimal demo UI — pick a persona + model, see allow/deny. Read per
-    request so edits to demo.html show up without a restart."""
-    try:
-        return _DEMO_HTML.read_text()
-    except OSError:
-        return "<h1>demo.html not found</h1>"
+@app.get("/")
+async def index() -> FileResponse:
+    """The chat UI — the single front door for the demo. Same service also
+    serves /reva/authorize (called by TrueFoundry) and /chat (called by this
+    page's JS), so there is exactly one URL and one UI."""
+    return FileResponse(_STATIC / "index.html")
+
+
+class ChatRequest(BaseModel):
+    message: str
+    user: str = "alice@analyst"
+    # Identity the orchestrator runs under. Client-chosen on purpose: swap it
+    # mid-demo and watch the Reva verdict flip.
+    agent_id: str = agents.ORCHESTRATOR_ID
+    model: str | None = None  # None -> whatever TFY_MODEL says.
+    servers: list[str] | None = None
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest) -> StreamingResponse:
+    """Server-sent events: trace events as they happen, then the final reply.
+
+    The orchestrator loop runs as a task while events drain from a queue, so a
+    slow tool call doesn't hold the trace back — the denial lands in real time.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def run() -> None:
+        try:
+            reply = await agents.orchestrate(
+                req.message, user=req.user, agent_id=req.agent_id,
+                model=req.model, servers=req.servers, emit=queue.put_nowait,
+            )
+            queue.put_nowait({"type": "reply", "text": reply})
+        except Exception as e:  # noqa: BLE001
+            queue.put_nowait({"type": "error", "text": str(e)[:200]})
+        finally:
+            queue.put_nowait(None)
+
+    async def stream():
+        task = asyncio.create_task(run())
+        try:
+            while (event := await queue.get()) is not None:
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+        finally:
+            task.cancel()
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 def _verdict_for(decision, cfg: RevaConfig) -> ValidateGuardrailResponse:

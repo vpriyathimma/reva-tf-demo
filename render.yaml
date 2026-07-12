@@ -37,6 +37,14 @@ services:
         value: "5.0"
       - key: REVA_DEBUG
         value: "0"
+      # --- orchestrator config: this service also serves the chat UI (/, /chat),
+      # whose agents.py routes calls through TrueFoundry via gateway.py ---
+      - key: TFY_LLM_URL
+        value: https://reva-demo.truefoundry.cloud/api/llm
+      - key: TFY_MCP_URL
+        value: https://gateway.truefoundry.ai/reva-demo/mcp
+      - key: TFY_MODEL
+        value: bedrock/amazon.nova-micro-v1-0
       # --- secrets: Render prompts for these on deploy; never commit them ---
       - key: REVA_PDP_URL
         sync: false
