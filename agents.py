@@ -191,6 +191,13 @@ async def orchestrate(
     """
     tools = await _available_tools(emit, servers, agent_id=agent_id, user=user)
     used_model = model or gateway.TFY_MODEL
+    # Nova can't do OpenAI-style tool-calling: handing it `tools` makes the gateway
+    # return 424 (failed dependency) on the malformed tool_use block it emits, so the
+    # chat-completion span looks broken. Withhold tools from Nova — the deterministic
+    # keyword→tool fallback below still runs the tool (and still routes through Reva),
+    # so the model call stays a clean 200. Tool-capable models (gpt-4o) keep tools.
+    tool_capable = "nova" not in (used_model or "").lower()
+    send_tools = tools if tool_capable else None
     # Carry prior turns so the payload BUILDS context across a session — the
     # requestBody.messages array grows [system, u1, a1, u2, a2, …, current]. This
     # is what lets TrueFoundry run intent guardrails over the whole conversation.
@@ -206,7 +213,7 @@ async def orchestrate(
     del max_turns  # single turn: Nova Micro can't sustain a multi-turn tool loop
     try:
         response = await gateway.chat(
-            messages, agent_id=agent_id, tools=tools or None, user=user, model=model
+            messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model
         )
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
