@@ -125,6 +125,9 @@ class ChatRequest(BaseModel):
     agent_id: str = agents.ORCHESTRATOR_ID
     model: str | None = None  # None -> whatever TFY_MODEL says.
     servers: list[str] | None = None
+    # Prior turns [{role, content}, …] the client carries so the payload builds
+    # context across a session (grows requestBody.messages each turn).
+    history: list[dict[str, Any]] | None = None
 
 
 @app.post("/chat")
@@ -140,7 +143,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         try:
             reply = await agents.orchestrate(
                 req.message, user=req.user, agent_id=req.agent_id,
-                model=req.model, servers=req.servers, emit=queue.put_nowait,
+                model=req.model, servers=req.servers, history=req.history,
+                emit=queue.put_nowait,
             )
             queue.put_nowait({"type": "reply", "text": reply})
         except Exception as e:  # noqa: BLE001

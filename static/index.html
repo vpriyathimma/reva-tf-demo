@@ -218,6 +218,7 @@ const box = document.getElementById('box');
 const send = document.getElementById('send');
 const reset = document.getElementById('reset');
 let cleared = false;
+let convo = [];   // accumulated conversation turns for context-building
 
 // The agent is always the billing-support-agent (that's the front door). Two dials
 // vary what Reva authorizes on: what the agent reasons with (model) and whom it
@@ -343,6 +344,7 @@ async function ask() {
     // each call — not a client-side switch.
     body: JSON.stringify({
       message, agent_id: AGENT_ID, model: dials.model, user: dials.user,
+      history: convo,   // prior turns → payload builds context across the session
     })
   });
 
@@ -359,7 +361,10 @@ async function ask() {
     for (const part of parts) {
       if (!part.startsWith('data: ')) continue;
       const e = JSON.parse(part.slice(6));
-      if (e.type === 'reply') { hideTyping(); bubble(e.text, 'bot'); }
+      if (e.type === 'reply') { hideTyping(); bubble(e.text, 'bot');
+        // Remember this turn so the next request carries the growing conversation.
+        convo.push({role: 'user', content: message}, {role: 'assistant', content: e.text});
+      }
       else event(e);
     }
   }
@@ -380,6 +385,7 @@ reset.onclick = () => {
     '<span class="sugg">Get the billing report for customer c1</span>' +
     '<span class="sugg">Now get the customer PII for c1</span></div>';
   clearTrace();
+  convo = [];   // new session → context starts fresh
   box.disabled = false; send.disabled = false; box.value = ''; box.focus();
 };
 

@@ -176,6 +176,7 @@ async def orchestrate(
     agent_id: str = ORCHESTRATOR_ID,
     model: str | None = None,
     servers: list[str] | None = None,
+    history: list[dict[str, Any]] | None = None,
     max_turns: int = 6,
 ) -> str:
     """Run the agent loop for one user message. `emit` streams trace events to the UI.
@@ -190,10 +191,17 @@ async def orchestrate(
     """
     tools = await _available_tools(emit, servers, agent_id=agent_id, user=user)
     used_model = model or gateway.TFY_MODEL
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": message},
-    ]
+    # Carry prior turns so the payload BUILDS context across a session — the
+    # requestBody.messages array grows [system, u1, a1, u2, a2, …, current]. This
+    # is what lets TrueFoundry run intent guardrails over the whole conversation.
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM}]
+    if history:
+        messages.extend(
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+            if isinstance(m, dict) and m.get("role") and m.get("content")
+        )
+    messages.append({"role": "user", "content": message})
 
     del max_turns  # single turn: Nova Micro can't sustain a multi-turn tool loop
     try:
