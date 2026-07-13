@@ -154,15 +154,6 @@
 <aside class="panel">
   <div class="brand">Reva × TrueFoundry</div>
 
-  <h4>Run as</h4>
-  <div class="dial">
-    <select id="agent">
-      <option value="billing-support-agent">billing-support-agent</option>
-      <option value="rogue-agent" data-deny>rogue-agent</option>
-    </select>
-    <span class="caret">▾</span>
-  </div>
-
   <h4>Model</h4>
   <div class="dial">
     <select id="model">
@@ -183,14 +174,9 @@
     <span class="caret">▾</span>
   </div>
 
-  <h4>Tools from</h4>
-  <div class="item on" data-server="billing-mcp"><span class="dot"></span>billing-mcp</div>
-  <div class="item on" data-server="external-mcp"><span class="dot"></span>external-mcp</div>
-  <div class="item" data-server="ticketing-agent"><span class="dot"></span>ticketing-agent</div>
-  <div class="item" data-server="booking-agent"><span class="dot"></span>booking-agent</div>
-
   <p class="foot">Every model, tool and agent-to-agent call is routed through
-  TrueFoundry and authorized by Reva before it runs.</p>
+  TrueFoundry and authorized by Reva before it runs. Tools are always available —
+  Reva decides each call by policy, not a switch.</p>
 </aside>
 
 <main class="panel">
@@ -233,16 +219,17 @@ const send = document.getElementById('send');
 const reset = document.getElementById('reset');
 let cleared = false;
 
-// Three dials, each a different axis Reva authorizes on: who is asking (agent),
-// what they want to use (model), and whom they act for (user). Each turns red
-// when the chosen value has no permit, so the sidebar predicts the verdict.
+// The agent is always the billing-support-agent (that's the front door). Two dials
+// vary what Reva authorizes on: what the agent reasons with (model) and whom it
+// acts for (user). Each turns red when the chosen value has no permit.
+const AGENT_ID = 'billing-support-agent';
 const dials = {};
 
-const META_LABEL = { agent: 'Run as', model: 'Model', user: 'On behalf of' };
+const META_LABEL = { model: 'Model', user: 'On behalf of' };
 
 function renderChips() {
   chips.innerHTML = '';
-  ['agent', 'model', 'user'].forEach(id => {
+  ['model', 'user'].forEach(id => {
     const sel = document.getElementById(id);
     const deny = sel.selectedOptions[0].hasAttribute('data-deny');
     const value = id === 'model' ? sel.value.split('/').pop() : sel.value;
@@ -263,15 +250,7 @@ function dial(id) {
   sel.onchange = sync;
   sync();
 }
-['agent', 'model', 'user'].forEach(dial);
-
-// Which MCP servers the orchestrator offers to the model. `.down` servers aren't
-// registered in TrueFoundry yet, so there is nothing to toggle.
-document.querySelectorAll('.item[data-server]:not(.down)').forEach(el => {
-  el.onclick = () => el.classList.toggle('on');
-});
-const chosenServers = () =>
-  [...document.querySelectorAll('.item[data-server].on')].map(el => el.dataset.server);
+['model', 'user'].forEach(dial);
 
 function bubble(text, who) {
   document.getElementById('empty')?.remove();
@@ -360,9 +339,10 @@ async function ask() {
   const res = await fetch('/chat', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
+    // No `servers` field: all tools are always offered, so Reva alone decides
+    // each call — not a client-side switch.
     body: JSON.stringify({
-      message, agent_id: dials.agent, model: dials.model, user: dials.user,
-      servers: chosenServers(),
+      message, agent_id: AGENT_ID, model: dials.model, user: dials.user,
     })
   });
 
