@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,24 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 authorizer = RevaAuthorizer()
 _STATIC = Path(__file__).with_name("static")
+
+# Ring buffer of the raw payloads TrueFoundry POSTs to /reva/*, so we can inspect
+# exactly what the gateway forwards to the plugin (headers + full body). In-memory,
+# last 25 only; served by GET /debug/payloads when REVA_DEBUG=1.
+_PAYLOAD_CAPTURE: deque = deque(maxlen=25)
+
+
+async def _capture_payload(request: "Request") -> None:
+    try:
+        raw = await request.body()  # FastAPI already read+cached it for the route
+        try:
+            body = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            body = {"_raw": raw.decode("utf-8", "replace")[:8000]}
+        headers = {k: v for k, v in request.headers.items() if k.lower() != "authorization"}
+        _PAYLOAD_CAPTURE.append({"path": request.url.path, "headers": headers, "body": body})
+    except Exception as e:  # noqa: BLE001 — capture must never break authorization
+        _log("WARN", f"payload capture failed: {type(e).__name__}: {e}")
 
 
 def _debug_dump(where: str, payload: dict[str, Any], cfg: RevaConfig) -> None:
@@ -167,6 +186,18 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/debug/payloads")
+async def debug_payloads() -> JSONResponse:
+    """Return the raw payloads TrueFoundry recently POSTed to /reva/* — headers +
+    full unparsed body — so we can see exactly which fields (user, prompt, history,
+    metadata) the gateway forwards to the plugin. Gated behind REVA_DEBUG because
+    the bodies contain prompts."""
+    if os.getenv("REVA_DEBUG", "0") != "1":
+        return JSONResponse(status_code=404,
+                            content={"detail": "set REVA_DEBUG=1 on the service to enable"})
+    return JSONResponse(content={"count": len(_PAYLOAD_CAPTURE), "payloads": list(_PAYLOAD_CAPTURE)})
+
+
 def _mcp_tool_call(context: dict[str, Any], request_body: dict[str, Any]) -> tuple[str, Any] | None:
     """Detect an MCP tool invocation and return (qualified_tool_id, arguments).
 
@@ -197,12 +228,13 @@ def _mcp_tool_call(context: dict[str, Any], request_body: dict[str, Any]) -> tup
 
 
 @app.post("/reva/authorize", response_model=ValidateGuardrailResponse)
-async def authorize(body: InputGuardrailRequest) -> ValidateGuardrailResponse:
+async def authorize(body: InputGuardrailRequest, request: Request) -> ValidateGuardrailResponse:
     """Authorize an LLM request (llm_input) or an MCP tool call (mcp_pre_tool).
 
     Both hooks arrive here because TrueFoundry binds one URL per guardrail
     config; we dispatch on the payload. VERIFIED against TF's contract.
     """
+    await _capture_payload(request)
     cfg = RevaConfig(body.config)
     _debug_dump("/reva/authorize", body.model_dump(mode="json"), cfg)
     try:
