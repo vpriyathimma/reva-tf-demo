@@ -254,7 +254,10 @@ async def authorize(body: InputGuardrailRequest, request: Request) -> ValidateGu
             eval_request, _user_id = authorizer.build_model_eval(
                 body.requestBody, context, cfg
             )
-        decision = await authorizer.evaluate(eval_request, cfg)
+        # Forward TrueFoundry's W3C traceparent to the PDP (Amit): same trace across the session.
+        decision = await authorizer.evaluate(
+            eval_request, cfg, incoming_traceparent=request.headers.get("traceparent")
+        )
     except Exception as e:  # noqa: BLE001 — a plugin bug must not 500 the gateway
         _log("WARN", f"unexpected error in /reva/authorize: {type(e).__name__}: {e}")
         allow = cfg.fail_mode == "open"
