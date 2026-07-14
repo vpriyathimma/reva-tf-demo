@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import sys
 import time
 import uuid
@@ -393,25 +394,54 @@ class RevaAuthorizer:
             })
         return {"messages": out}
 
-    @staticmethod
-    def _hops(agent_id: str, action_name: str, resource: dict[str, Any],
-              user_id: str, now: str) -> list[dict[str, Any]]:
-        """context.hops[] — the delegation chain that led here. hop 1 is always the
-        end user invoking the orchestrator; hop 2 is the orchestrator invoking the
-        current tool/model. hop.seq aligns with conversation message seq.
+    # An orchestrator tool result reaches the model phrased as
+    # "billing-mcp/get_billing_report returned: {...}" (see agents._phrase). That
+    # server-qualified id is exactly the hop's Tool resource id.
+    _TOOL_RESULT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s+returned:")
 
-        NOTE (open item for Amit): deeper agent→agent→tool chains need the
-        orchestrator to forward the full hop stack via metadata; this reconstructs
-        the minimal user→agent→resource path from what a single eval carries."""
-        return [
-            {"seq": 1, "subject": {"type": "User", "id": user_id},
-             "action": "invokeAgent", "resource": {"type": "Agent", "id": agent_id},
-             "time": now},
-            {"seq": 2, "subject": {"type": "Agent", "id": agent_id},
-             "action": action_name,
-             "resource": {"type": resource.get("type"), "id": resource.get("id")},
-             "time": now},
-        ]
+    @classmethod
+    def _tool_from_result(cls, content: str) -> str | None:
+        m = cls._TOOL_RESULT.match((content or "").strip())
+        return m.group(1) if m else None
+
+    @classmethod
+    def _hops(cls, agent_id: str, conv_messages: list[dict[str, Any]],
+              user_id: str, now: str) -> list[dict[str, Any]]:
+        """context.hops[] — the delegation chain, seq-aligned to the conversation
+        (Amit: "hop 1 = message 1 ... one, one, two, two"). ONE hop per conversation
+        message, keyed on that message's seq:
+          * a user message  -> user invoked the agent   (User -> invokeAgent -> Agent)
+          * a tool result   -> agent invoked that tool   (Agent -> invokeTool -> Tool)
+          * any other agent turn -> agent invoked its model (Agent -> invokeModel)
+        The CURRENT action (this eval's tool/model) is NOT a hop — it lives in the
+        top-level action/resource, exactly as in Karthik's payload.
+
+        When the conversation is empty (turn 1), we still record the single
+        User -> invokeAgent hop for the current invocation, matching the simple curl
+        Amit sent (empty conversation, one hop)."""
+        hops: list[dict[str, Any]] = []
+        for m in conv_messages:
+            seq = m.get("seq")
+            t = m.get("timestamp") or now
+            if m.get("role") == "user":
+                hops.append({"seq": seq, "subject": {"type": "User", "id": user_id},
+                             "action": "invokeAgent",
+                             "resource": {"type": "Agent", "id": agent_id}, "time": t})
+                continue
+            tool = cls._tool_from_result(m.get("content", ""))
+            if tool:
+                hops.append({"seq": seq, "subject": {"type": "Agent", "id": agent_id},
+                             "action": "invokeTool",
+                             "resource": {"type": "Tool", "id": tool}, "time": t})
+            else:
+                hops.append({"seq": seq, "subject": {"type": "Agent", "id": agent_id},
+                             "action": "invokeModel",
+                             "resource": {"type": "Model", "id": "model"}, "time": t})
+        if not hops:
+            hops.append({"seq": 1, "subject": {"type": "User", "id": user_id},
+                         "action": "invokeAgent",
+                         "resource": {"type": "Agent", "id": agent_id}, "time": now})
+        return hops
 
     # -- eval-request construction -----------------------------------------
     def build_model_eval(
@@ -448,7 +478,7 @@ class RevaAuthorizer:
                         "properties": {"provider": provider}}
             context = self._ai_context(user_id, meta)
             context["conversation"] = self._conversation(messages, now)
-            context["hops"] = self._hops(agent_id, "invokeModel", resource, user_id, now)
+            context["hops"] = self._hops(agent_id, context["conversation"]["messages"], user_id, now)
             eval_request = {
                 "subject": {"type": "Agent", "id": agent_id, "name": meta.get("agent_name") or agent_id},
                 "action": {"name": "invokeModel"},
@@ -541,7 +571,7 @@ class RevaAuthorizer:
             # under `conversation`/`messages`, map it; else send an empty list.
             history = meta.get("conversation") or meta.get("messages")
             context["conversation"] = self._conversation(history, now) if history else {"messages": []}
-            context["hops"] = self._hops(agent_id, "invokeTool", resource, user_id, now)
+            context["hops"] = self._hops(agent_id, context["conversation"]["messages"], user_id, now)
             turn = self._turn(history) if history else int(meta.get("turn") or 1)
             eval_request = {
                 "subject": {"type": "Agent", "id": agent_id, "name": meta.get("agent_name") or agent_id},
