@@ -33,8 +33,8 @@ TrueFoundry AI Gateway
 
 | Method | Path                   | Purpose                                              | Contract status |
 |--------|------------------------|------------------------------------------------------|-----------------|
-| POST   | `/reva/authorize`      | Authorize an LLM call **and** an MCP tool call       | ✅ Verified against live TF traffic |
-| POST   | `/reva/authorize-tool` | Tool-only endpoint for non-TF callers                | ✅ Reachable, but TF does not route here by default |
+| POST   | `/reva/authorize`      | Authorize an LLM call **and** an MCP tool call       | Verified against live TF traffic |
+| POST   | `/reva/authorize-tool` | Tool-only endpoint for non-TF callers                | Reachable, but TF does not route here by default |
 | GET    | `/healthz`             | Liveness                                             | — |
 
 > **TrueFoundry sends *both* hooks to one URL.** A guardrail config in the TF
