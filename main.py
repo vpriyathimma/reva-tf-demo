@@ -13,6 +13,7 @@ fail-mode verdict so gateway traffic behaves predictably.
 Endpoints (paths are referenced from the TrueFoundry integration form):
   * POST /reva/authorize        — CallModel: authorize an LLM request  (VERIFIED contract)
   * POST /reva/authorize-tool   — InvokeTool: authorize an MCP tool call (UNVERIFIED — see below)
+  * POST /reva/authorize-output — CAPTURE-ONLY probe: record TF's OUTPUT payload (no policy)
   * GET  /healthz               — liveness
 """
 
@@ -302,6 +303,41 @@ async def authorize_tool(request: Request) -> ValidateGuardrailResponse:
             message=f"plugin error: {type(e).__name__} — failing {'open' if allow else 'closed'}",
         )
     return _verdict_for(decision, cfg)
+
+
+@app.post("/reva/authorize-output")
+async def authorize_output(request: Request) -> JSONResponse:
+    """CAPTURE-ONLY output-guardrail probe — no policy, never blocks.
+
+    Purpose: capture the EXACT payload TrueFoundry sends on the OUTPUT side
+    (its ``OutputGuardrailRequest``: requestBody + responseBody + context +
+    config) so we can analyse what information is available on the way back —
+    especially ``responseBody`` (the model's completion / tool_calls).
+
+    How to use: register THIS url as an *output* guardrail in the TF gateway,
+    set REVA_DEBUG=1, send one request through the gateway, then read
+    GET /debug/payloads to see the real bytes.
+
+    This is a read-only probe for analysis, NOT an output filter — it always
+    returns verdict=True (never blocks, never mutates). Turning Reva into a
+    real output filter (validate/mutate on responseBody) is a later change.
+    """
+    await _capture_payload(request)
+    try:
+        raw: dict[str, Any] = await request.json()
+    except Exception:  # noqa: BLE001 — probe must never break gateway traffic
+        raw = {}
+    resp = raw.get("responseBody")
+    _log(
+        "INFO",
+        f"/reva/authorize-output captured — top-level keys={sorted(raw.keys())} "
+        f"responseBody_present={resp is not None} "
+        f"responseBody_keys={sorted(resp.keys()) if isinstance(resp, dict) else None}",
+    )
+    return JSONResponse(
+        status_code=200,
+        content={"verdict": True, "message": "output payload captured (probe — no policy)"},
+    )
 
 
 # Registered last: FastAPI matches routes in definition order, so every route
