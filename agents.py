@@ -74,13 +74,17 @@ async def _available_tools(
 
 async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
                     *, agent_id: str | None = None, user: str | None = None,
-                    traceparent: str | None = None) -> str:
-    """Execute one tool call and return what the model should see as its result."""
+                    traceparent: str | None = None,
+                    conversation: list[dict[str, Any]] | None = None) -> str:
+    """Execute one tool call and return what the model should see as its result.
+
+    `conversation` is the turn's history so far; forwarded so the tool-call eval
+    carries chatHistory + hops instead of an empty list."""
     server, tool = name.split("__", 1)
     emit({"type": "tool_call", "server": server, "tool": tool, "arguments": arguments})
     try:
         result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user,
-                                         traceparent=traceparent)
+                                         traceparent=traceparent, conversation=conversation)
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
             emit({"type": "denied", "server": server, "tool": tool})
@@ -179,10 +183,15 @@ async def _run_fallback(
     if not intents:
         return None
     replies: list[str] = []
+    # Running conversation, so each successive tool's eval shows the history that
+    # led to it (the user prompt + prior tool results) — chatHistory + hops fill
+    # progressively, the same way LiteLLM's loop builds them.
+    convo: list[dict[str, Any]] = [{"role": "user", "content": message}]
     for server, tool, args in intents:
         result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user,
-                                 traceparent=traceparent)
+                                 traceparent=traceparent, conversation=list(convo))
         replies.append(_phrase(f"{server}__{tool}", result))
+        convo.append({"role": "tool", "content": f"{server}/{tool} returned: {result[:600]}"})
     return "\n".join(replies)
 
 

@@ -123,14 +123,15 @@ async def chat(
 
 
 def _mcp_client(server: str, *, agent_id: str | None = None, user: str | None = None,
-                traceparent: str | None = None) -> Client:
+                traceparent: str | None = None,
+                conversation: list[dict[str, Any]] | None = None) -> Client:
     # Forward the acting agent + on-behalf-of user in X-TFY-METADATA, exactly like
     # the LLM client does. Without this, TrueFoundry fills the MCP guardrail context
     # with the API key's owner, so Reva sees the wrong user and on-behalf-of tool
     # policies (e.g. "bob@intern cannot pull billing reports") never match.
     headers = {"Authorization": f"Bearer {_require_key()}"}
-    if agent_id or user or traceparent:
-        meta: dict[str, str] = {}
+    if agent_id or user or traceparent or conversation:
+        meta: dict[str, Any] = {}
         if agent_id:
             meta["agent_id"] = agent_id
         if user:
@@ -139,6 +140,10 @@ def _mcp_client(server: str, *, agent_id: str | None = None, user: str | None = 
         # trace — TF forwards X-TFY-METADATA but not the raw traceparent header.
         if traceparent:
             meta["traceparent"] = traceparent
+        # The turn's history so the tool-call eval carries chatHistory + hops.
+        # Kept small (a few short messages) so it fits the metadata header.
+        if conversation:
+            meta["conversation"] = conversation
         headers["X-TFY-METADATA"] = json.dumps(meta)
     # Same turn-level trace id as the LLM hop, so this MCP call joins the same trace.
     if traceparent:
@@ -205,7 +210,8 @@ async def list_tools(server: str, *, agent_id: str | None = None, user: str | No
 
 async def call_tool(server: str, tool: str, arguments: dict[str, Any],
                     *, agent_id: str | None = None, user: str | None = None,
-                    traceparent: str | None = None) -> Any:
+                    traceparent: str | None = None,
+                    conversation: list[dict[str, Any]] | None = None) -> Any:
     """Invoke one MCP tool through the gateway.
 
     Raises whatever the gateway raises. A Reva denial surfaces here as an
@@ -221,7 +227,8 @@ async def call_tool(server: str, tool: str, arguments: dict[str, Any],
     if server in SUBAGENT_SERVERS:
         args["traceparent"] = traceparent or ""
         args["on_behalf_of"] = user or ""
-    async with _mcp_client(server, agent_id=agent_id, user=user, traceparent=traceparent) as c:
+    async with _mcp_client(server, agent_id=agent_id, user=user, traceparent=traceparent,
+                           conversation=conversation) as c:
         result = await c.call_tool(tool, args)
         _log(f"mcp ← ok server={server} tool={tool}")
         return result.structured_content or result.content
