@@ -92,6 +92,13 @@ async def chat(
     metadata = {"agent_id": agent_id}
     if user:
         metadata["reva_user"] = user
+    # Put the turn's traceparent INSIDE X-TFY-METADATA, not only on a raw header.
+    # TrueFoundry forwards X-TFY-METADATA into the guardrail's context.metadata
+    # (that's how agent_id reaches the plugin), but it does NOT forward the raw
+    # traceparent header — it sends its own per-call one. Carrying the turn id in
+    # metadata is the only way every hop's PDP eval shares one trace.
+    if traceparent:
+        metadata["traceparent"] = traceparent
 
     default_headers = {"X-TFY-METADATA": json.dumps(metadata)}
     if traceparent:
@@ -122,12 +129,16 @@ def _mcp_client(server: str, *, agent_id: str | None = None, user: str | None = 
     # with the API key's owner, so Reva sees the wrong user and on-behalf-of tool
     # policies (e.g. "bob@intern cannot pull billing reports") never match.
     headers = {"Authorization": f"Bearer {_require_key()}"}
-    if agent_id or user:
+    if agent_id or user or traceparent:
         meta: dict[str, str] = {}
         if agent_id:
             meta["agent_id"] = agent_id
         if user:
             meta["reva_user"] = user
+        # Turn traceparent in metadata too, so the tool-call eval joins the same
+        # trace — TF forwards X-TFY-METADATA but not the raw traceparent header.
+        if traceparent:
+            meta["traceparent"] = traceparent
         headers["X-TFY-METADATA"] = json.dumps(meta)
     # Same turn-level trace id as the LLM hop, so this MCP call joins the same trace.
     if traceparent:
