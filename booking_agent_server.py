@@ -24,14 +24,18 @@ mcp = FastMCP("booking-agent")
 _SLOTS = ["2026-07-14T10:00Z", "2026-07-14T14:00Z", "2026-07-15T09:00Z"]
 
 
+# traceparent / on_behalf_of are injected by the calling app for sub-agent
+# servers and stripped from the model's view. Booking does no nested model call,
+# so they're accepted-but-unused here (they must be accepted or the call errors).
 @mcp.tool
-def list_slots() -> dict:
+def list_slots(traceparent: str = "", on_behalf_of: str = "") -> dict:
     """List available callback slots for a customer support call."""
     return {"slots": _SLOTS}
 
 
 @mcp.tool
-def book_slot(customer_id: str, slot: str) -> dict:
+def book_slot(customer_id: str, slot: str,
+              traceparent: str = "", on_behalf_of: str = "") -> dict:
     """Book a callback slot for a customer."""
     if slot not in _SLOTS:
         return {"error": "slot unavailable", "slot": slot}

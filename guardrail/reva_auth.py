@@ -224,6 +224,20 @@ def _build_traceparent(trace_id: str | None = None) -> str:
     return f"00-{tid}-{sid}-01"
 
 
+def _trace_id_of(traceparent: str) -> str:
+    """The 32-hex trace-id from a W3C traceparent (00-<trace>-<span>-01).
+
+    The value the Reva console shows as "Trace ID" and groups Decision Logs by,
+    so every hop of a turn must send it as the correlation id."""
+    parts = (traceparent or "").split("-")
+    return parts[1] if len(parts) >= 2 and parts[1] else uuid.uuid4().hex
+
+
+def _span_id_of(traceparent: str) -> str:
+    """The 16-hex span-id (3rd field) of a W3C traceparent."""
+    parts = (traceparent or "").split("-")
+    return parts[2] if len(parts) >= 3 and parts[2] else uuid.uuid4().hex[:16]
+
 # ---------------------------------------------------------------------------
 # The authorizer
 # ---------------------------------------------------------------------------
@@ -362,7 +376,8 @@ class RevaAuthorizer:
         return n or 1
 
     @staticmethod
-    def _conversation(messages: list[Any] | None, now: str) -> dict[str, Any]:
+    def _conversation(messages: list[Any] | None, now: str,
+                      keep_current_prompt: bool = False) -> dict[str, Any]:
         """context.conversation.messages[] — the accumulated history, EXCLUDING the
         system instruction and the current prompt (the last user message, which goes
         to transmission). Each entry is {seq, role, content, timestamp}.
@@ -373,16 +388,17 @@ class RevaAuthorizer:
         TrueFoundry payload, so we stamp receipt time and note it."""
         msgs = messages or []
         last_user = None
-        for i in range(len(msgs) - 1, -1, -1):
-            if isinstance(msgs[i], dict) and msgs[i].get("role") == "user":
-                last_user = i
-                break
+        if not keep_current_prompt:
+            for i in range(len(msgs) - 1, -1, -1):
+                if isinstance(msgs[i], dict) and msgs[i].get("role") == "user":
+                    last_user = i
+                    break
         out: list[dict[str, Any]] = []
         for i, m in enumerate(msgs):
             if not isinstance(m, dict) or m.get("role") == "system":
                 continue
-            if last_user is not None and i >= last_user:
-                break  # stop before the current prompt
+            if last_user is not None and i == last_user:
+                continue  # skip only the current prompt; keep intra-turn results
             c = m.get("content")
             if isinstance(c, list):  # OpenAI content-parts form
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
@@ -477,7 +493,10 @@ class RevaAuthorizer:
             resource = {"type": "Model", "id": model, "name": model,
                         "properties": {"provider": provider}}
             context = self._ai_context(user_id, meta)
-            context["conversation"] = self._conversation(messages, now)
+            context["conversation"] = self._conversation(messages, now, keep_current_prompt=True)
+            # Console Decision Logs render history under `chatHistory`
+            # (matches Sarthak's Kong payload); emit the same flat array.
+            context["chatHistory"] = context["conversation"]["messages"]
             context["hops"] = self._hops(agent_id, context["conversation"]["messages"], user_id, now)
             eval_request = {
                 "subject": {"type": "Agent", "id": agent_id, "name": meta.get("agent_name") or agent_id},
@@ -570,7 +589,13 @@ class RevaAuthorizer:
             # deployment (or the orchestrator via metadata) supplies the transcript
             # under `conversation`/`messages`, map it; else send an empty list.
             history = meta.get("conversation") or meta.get("messages")
-            context["conversation"] = self._conversation(history, now) if history else {"messages": []}
+            # A tool call has no current user prompt to hold back (its transmission
+            # is the tool args), so include the whole conversation.
+            context["conversation"] = (
+                self._conversation(history, now, keep_current_prompt=True)
+                if history else {"messages": []}
+            )
+            context["chatHistory"] = context["conversation"]["messages"]
             context["hops"] = self._hops(agent_id, context["conversation"]["messages"], user_id, now)
             turn = self._turn(history) if history else int(meta.get("turn") or 1)
             eval_request = {
@@ -650,14 +675,24 @@ class RevaAuthorizer:
         # origin + traceparent).
         if cfg.schema_mode == "agent_v5":
             token = cfg.auth_token
+            # The traceparent this call sends — TrueFoundry's inbound one when
+            # present, else a minted one.
+            traceparent = incoming_traceparent or _build_traceparent(trace_id)
+            # The console reads the trace from the request BODY (Decision Logs
+            # show trace_source: request-body), so put the shared turn id there —
+            # else the PDP mints one per hop and the trace filter scatters them.
+            eval_request["trace_id"] = _trace_id_of(traceparent)
+            eval_request["parent_span_id"] = _span_id_of(traceparent)
             headers = {
                 "Content-Type": "application/json",
                 "policyStoreId": cfg.policy_store_id,
                 "Authorization": token if token.lower().startswith("bearer ") else f"Bearer {token}",
-                "x-ms-correlation-id": trace_id,
-                # Forward TrueFoundry's own W3C traceparent so the whole session
-                # shares one trace; fall back to a minted one only if TF sent none.
-                "traceparent": incoming_traceparent or _build_traceparent(trace_id),
+                # The Reva console groups Decision Logs by the correlation id, so
+                # it MUST be the shared turn id (the traceparent's trace-id part),
+                # not a per-call uuid — else each hop lands under its own id and
+                # the trace filter shows them scattered instead of one chain.
+                "x-ms-correlation-id": _trace_id_of(traceparent),
+                "traceparent": traceparent,
             }
         else:
             token = cfg.auth_token

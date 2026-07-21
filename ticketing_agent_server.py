@@ -37,8 +37,12 @@ AGENT_ID = "ticketing-agent"
 _TICKETS: dict[str, dict] = {}
 
 
-async def _triage(summary: str) -> dict:
-    """Ask a model (as this agent) to classify the issue. Returns triage or a note."""
+async def _triage(summary: str, *, traceparent: str | None = None,
+                  on_behalf_of: str | None = None) -> dict:
+    """Ask a model (as this agent) to classify the issue. Returns triage or a note.
+
+    traceparent / on_behalf_of are injected by the calling app so this nested
+    model call joins the same trace and acts for the same end user."""
     try:
         r = await gateway.chat(
             [
@@ -47,6 +51,8 @@ async def _triage(summary: str) -> dict:
                 {"role": "user", "content": summary},
             ],
             agent_id=AGENT_ID,
+            user=on_behalf_of or None,
+            traceparent=traceparent or None,
         )
         return {"triage": (r.choices[0].message.content or "").strip(),
                 "reasoned_by": f"{AGENT_ID} (own model call via TrueFoundry)"}
@@ -59,12 +65,17 @@ async def _triage(summary: str) -> dict:
 
 
 @mcp.tool
-async def create_ticket(customer_id: str, summary: str) -> dict:
-    """Open a support ticket. The ticketing-agent triages it via its own model call."""
+async def create_ticket(customer_id: str, summary: str,
+                        traceparent: str = "", on_behalf_of: str = "") -> dict:
+    """Open a support ticket. The ticketing-agent triages it via its own model call.
+
+    traceparent / on_behalf_of are injected by the calling app (stripped from the
+    model's view) so the triage model call joins the same trace."""
     ticket_id = f"TKT-{1000 + len(_TICKETS)}"
     _TICKETS[ticket_id] = {"customer_id": customer_id, "summary": summary, "status": "open"}
     result = {"ticket_id": ticket_id, "status": "open", "customer_id": customer_id}
-    result.update(await _triage(summary))
+    result.update(await _triage(summary, traceparent=traceparent or None,
+                                on_behalf_of=on_behalf_of or None))
     return result
 
 
