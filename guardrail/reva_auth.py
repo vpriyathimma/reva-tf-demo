@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import sys
 import time
 import uuid
@@ -223,6 +224,20 @@ def _build_traceparent(trace_id: str | None = None) -> str:
     return f"00-{tid}-{sid}-01"
 
 
+def _trace_id_of(traceparent: str) -> str:
+    """The 32-hex trace-id from a W3C traceparent (00-<trace>-<span>-01).
+
+    The value the Reva console shows as "Trace ID" and groups Decision Logs by,
+    so every hop of a turn must send it as the correlation id."""
+    parts = (traceparent or "").split("-")
+    return parts[1] if len(parts) >= 2 and parts[1] else uuid.uuid4().hex
+
+
+def _span_id_of(traceparent: str) -> str:
+    """The 16-hex span-id (3rd field) of a W3C traceparent."""
+    parts = (traceparent or "").split("-")
+    return parts[2] if len(parts) >= 3 and parts[2] else uuid.uuid4().hex[:16]
+
 # ---------------------------------------------------------------------------
 # The authorizer
 # ---------------------------------------------------------------------------
@@ -350,8 +365,99 @@ class RevaAuthorizer:
         return ctx
 
     @staticmethod
-    def _session(meta: dict[str, Any], now: str) -> dict[str, Any]:
-        return {"id": meta.get("session_id") or uuid.uuid4().hex, "turn": 1, "startedAt": now}
+    def _session(meta: dict[str, Any], now: str, turn: int = 1) -> dict[str, Any]:
+        return {"id": meta.get("session_id") or uuid.uuid4().hex, "turn": turn, "startedAt": now}
+
+    @staticmethod
+    def _turn(messages: list[Any] | None) -> int:
+        """Turn number = how many user messages the session has seen (incl. the
+        current one). New contract wants the real turn; the old code pinned it to 1."""
+        n = sum(1 for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user")
+        return n or 1
+
+    @staticmethod
+    def _conversation(messages: list[Any] | None, now: str,
+                      keep_current_prompt: bool = False) -> dict[str, Any]:
+        """context.conversation.messages[] — the accumulated history, EXCLUDING the
+        system instruction and the current prompt (the last user message, which goes
+        to transmission). Each entry is {seq, role, content, timestamp}.
+
+        This is the field the intent engine reads to judge drift across a session.
+        The vanilla/agent_v5 contract never sent it, so older messages were invisible
+        to the engine — the gap Amit flagged. Per-message timestamps aren't in the
+        TrueFoundry payload, so we stamp receipt time and note it."""
+        msgs = messages or []
+        last_user = None
+        if not keep_current_prompt:
+            for i in range(len(msgs) - 1, -1, -1):
+                if isinstance(msgs[i], dict) and msgs[i].get("role") == "user":
+                    last_user = i
+                    break
+        out: list[dict[str, Any]] = []
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict) or m.get("role") == "system":
+                continue
+            if last_user is not None and i == last_user:
+                continue  # skip only the current prompt; keep intra-turn results
+            c = m.get("content")
+            if isinstance(c, list):  # OpenAI content-parts form
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            out.append({
+                "seq": len(out) + 1,
+                "role": m.get("role"),
+                "content": str(c or "")[:4000],
+                "timestamp": now,
+            })
+        return {"messages": out}
+
+    # An orchestrator tool result reaches the model phrased as
+    # "billing-mcp/get_billing_report returned: {...}" (see agents._phrase). That
+    # server-qualified id is exactly the hop's Tool resource id.
+    _TOOL_RESULT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s+returned:")
+
+    @classmethod
+    def _tool_from_result(cls, content: str) -> str | None:
+        m = cls._TOOL_RESULT.match((content or "").strip())
+        return m.group(1) if m else None
+
+    @classmethod
+    def _hops(cls, agent_id: str, conv_messages: list[dict[str, Any]],
+              user_id: str, now: str) -> list[dict[str, Any]]:
+        """context.hops[] — the delegation chain, seq-aligned to the conversation
+        (Amit: "hop 1 = message 1 ... one, one, two, two"). ONE hop per conversation
+        message, keyed on that message's seq:
+          * a user message  -> user invoked the agent   (User -> invokeAgent -> Agent)
+          * a tool result   -> agent invoked that tool   (Agent -> invokeTool -> Tool)
+          * any other agent turn -> agent invoked its model (Agent -> invokeModel)
+        The CURRENT action (this eval's tool/model) is NOT a hop — it lives in the
+        top-level action/resource, exactly as in Karthik's payload.
+
+        When the conversation is empty (turn 1), we still record the single
+        User -> invokeAgent hop for the current invocation, matching the simple curl
+        Amit sent (empty conversation, one hop)."""
+        hops: list[dict[str, Any]] = []
+        for m in conv_messages:
+            seq = m.get("seq")
+            t = m.get("timestamp") or now
+            if m.get("role") == "user":
+                hops.append({"seq": seq, "subject": {"type": "User", "id": user_id},
+                             "action": "invokeAgent",
+                             "resource": {"type": "Agent", "id": agent_id}, "time": t})
+                continue
+            tool = cls._tool_from_result(m.get("content", ""))
+            if tool:
+                hops.append({"seq": seq, "subject": {"type": "Agent", "id": agent_id},
+                             "action": "invokeTool",
+                             "resource": {"type": "Tool", "id": tool}, "time": t})
+            else:
+                hops.append({"seq": seq, "subject": {"type": "Agent", "id": agent_id},
+                             "action": "invokeModel",
+                             "resource": {"type": "Model", "id": "model"}, "time": t})
+        if not hops:
+            hops.append({"seq": 1, "subject": {"type": "User", "id": user_id},
+                         "action": "invokeAgent",
+                         "resource": {"type": "Agent", "id": agent_id}, "time": now})
+        return hops
 
     # -- eval-request construction -----------------------------------------
     def build_model_eval(
@@ -383,19 +489,28 @@ class RevaAuthorizer:
                 or user.get("subjectSlug") or user.get("subjectId") or "anonymous"
             )
             now = self._iso_now()
+            messages = request_body.get("messages")
+            resource = {"type": "Model", "id": model, "name": model,
+                        "properties": {"provider": provider}}
+            context = self._ai_context(user_id, meta)
+            context["conversation"] = self._conversation(messages, now, keep_current_prompt=True)
+            # Console Decision Logs render history under `chatHistory`
+            # (matches Sarthak's Kong payload); emit the same flat array.
+            context["chatHistory"] = context["conversation"]["messages"]
+            context["hops"] = self._hops(agent_id, context["conversation"]["messages"], user_id, now)
             eval_request = {
                 "subject": {"type": "Agent", "id": agent_id, "name": meta.get("agent_name") or agent_id},
                 "action": {"name": "invokeModel"},
-                "resource": {"type": "Model", "id": model, "name": model,
-                             "properties": {"provider": provider}},
+                "resource": resource,
                 "principal": {"type": "User", "id": user_id},
-                "context": self._ai_context(user_id, meta),
+                "context": context,
                 "transmission": {"promptKey": "content", "role": "user",
                                  "contentType": "text/plain",
                                  "content": self._extract_prompt(request_body)},
-                "session": self._session(meta, now),
+                "session": self._session(meta, now, self._turn(messages)),
             }
-            _log("INFO", f"[ai-eval] invokeModel agent={agent_id} model={model} user={user_id}")
+            _log("INFO", f"[ai-eval] invokeModel agent={agent_id} model={model} user={user_id} "
+                         f"history={len(context['conversation']['messages'])} turn={eval_request['session']['turn']}")
             return eval_request, agent_id
 
         user_id, team, tier, user_properties = self._resolve_identity(user, meta)
@@ -465,22 +580,41 @@ class RevaAuthorizer:
                 or user.get("subjectSlug") or user.get("subjectId") or "anonymous"
             )
             now = self._iso_now()
+            resource = {"type": "Tool", "id": tool_name, "name": tool_name}
+            context = self._ai_context(user_id, meta)
+            # Tool-call authorizations from TrueFoundry today carry NO message
+            # history (the mcp_pre_tool payload is just the tool args), so the
+            # intent engine can't judge a tool call against the conversation —
+            # exactly the drift gap Amit described. Forward-compatible: if the new
+            # deployment (or the orchestrator via metadata) supplies the transcript
+            # under `conversation`/`messages`, map it; else send an empty list.
+            history = meta.get("conversation") or meta.get("messages")
+            # A tool call has no current user prompt to hold back (its transmission
+            # is the tool args), so include the whole conversation.
+            context["conversation"] = (
+                self._conversation(history, now, keep_current_prompt=True)
+                if history else {"messages": []}
+            )
+            context["chatHistory"] = context["conversation"]["messages"]
+            context["hops"] = self._hops(agent_id, context["conversation"]["messages"], user_id, now)
+            turn = self._turn(history) if history else int(meta.get("turn") or 1)
             eval_request = {
                 "subject": {"type": "Agent", "id": agent_id, "name": meta.get("agent_name") or agent_id},
                 "action": {"name": "invokeTool"},
                 # Authoritative Tool attributes (dataClassification, riskTier,
                 # requiresHumanApproval) are resolved by the PDP from the
                 # published store entity; we send type+id+name.
-                "resource": {"type": "Tool", "id": tool_name, "name": tool_name},
+                "resource": resource,
                 "principal": {"type": "User", "id": user_id},
-                "context": self._ai_context(user_id, meta),
+                "context": context,
                 "transmission": {"promptKey": "content", "role": "user",
                                  "contentType": "text/plain",
                                  "content": str(arguments or "")[:2000]},
                 "inputValues": arguments if isinstance(arguments, dict) else {},
-                "session": self._session(meta, now),
+                "session": self._session(meta, now, turn),
             }
-            _log("INFO", f"[ai-eval] invokeTool agent={agent_id} tool={tool_name} user={user_id}")
+            _log("INFO", f"[ai-eval] invokeTool agent={agent_id} tool={tool_name} user={user_id} "
+                         f"history={len(context['conversation']['messages'])}")
             return eval_request, agent_id
 
         user_id, team, _tier, user_properties = self._resolve_identity(user, meta)
@@ -513,12 +647,17 @@ class RevaAuthorizer:
         return eval_request, user_id
 
     # -- PDP call -----------------------------------------------------------
-    async def evaluate(self, eval_request: dict[str, Any], cfg: RevaConfig) -> Decision:
+    async def evaluate(self, eval_request: dict[str, Any], cfg: RevaConfig,
+                       *, incoming_traceparent: str | None = None) -> Decision:
         """POST the eval request to the Reva PDP and normalize the outcome.
 
         On success returns a Decision with allow/deny from the PDP. On any
         transport/HTTP error returns a Decision flagged ``errored=True`` with
         allow left unset-appropriate; the FastAPI layer applies the fail mode.
+
+        `incoming_traceparent` is the W3C traceparent TrueFoundry put on the
+        request to us; per Amit we FORWARD the same one to the PDP so a session's
+        calls share a trace, instead of minting a fresh id per hop.
         """
         trace_id = uuid.uuid4().hex
 
@@ -536,11 +675,24 @@ class RevaAuthorizer:
         # origin + traceparent).
         if cfg.schema_mode == "agent_v5":
             token = cfg.auth_token
+            # The traceparent this call sends — TrueFoundry's inbound one when
+            # present, else a minted one.
+            traceparent = incoming_traceparent or _build_traceparent(trace_id)
+            # The console reads the trace from the request BODY (Decision Logs
+            # show trace_source: request-body), so put the shared turn id there —
+            # else the PDP mints one per hop and the trace filter scatters them.
+            eval_request["trace_id"] = _trace_id_of(traceparent)
+            eval_request["parent_span_id"] = _span_id_of(traceparent)
             headers = {
                 "Content-Type": "application/json",
                 "policyStoreId": cfg.policy_store_id,
                 "Authorization": token if token.lower().startswith("bearer ") else f"Bearer {token}",
-                "x-ms-correlation-id": trace_id,
+                # The Reva console groups Decision Logs by the correlation id, so
+                # it MUST be the shared turn id (the traceparent's trace-id part),
+                # not a per-call uuid — else each hop lands under its own id and
+                # the trace filter shows them scattered instead of one chain.
+                "x-ms-correlation-id": _trace_id_of(traceparent),
+                "traceparent": traceparent,
             }
         else:
             token = cfg.auth_token

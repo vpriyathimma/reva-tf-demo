@@ -53,6 +53,7 @@ def _is_denial(err: Exception) -> bool:
 async def _available_tools(
     emit: Callable[[dict], None], servers: list[str] | None = None,
     *, agent_id: str | None = None, user: str | None = None,
+    traceparent: str | None = None,
 ) -> list[dict[str, Any]]:
     """Discover tools from each selected server. A server that is down is skipped
     rather than fatal -- the demo should degrade, not collapse.
@@ -64,19 +65,22 @@ async def _available_tools(
     tools: list[dict[str, Any]] = []
     for server in (servers if servers is not None else SERVERS):
         try:
-            tools.extend(await gateway.list_tools(server, agent_id=agent_id, user=user))
+            tools.extend(await gateway.list_tools(server, agent_id=agent_id, user=user,
+                                                  traceparent=traceparent))
         except Exception as e:  # noqa: BLE001
             emit({"type": "warn", "text": f"{server} unreachable: {str(e)[:80]}"})
     return tools
 
 
 async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
-                    *, agent_id: str | None = None, user: str | None = None) -> str:
+                    *, agent_id: str | None = None, user: str | None = None,
+                    traceparent: str | None = None) -> str:
     """Execute one tool call and return what the model should see as its result."""
     server, tool = name.split("__", 1)
     emit({"type": "tool_call", "server": server, "tool": tool, "arguments": arguments})
     try:
-        result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user)
+        result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user,
+                                         traceparent=traceparent)
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
             emit({"type": "denied", "server": server, "tool": tool})
@@ -122,15 +126,20 @@ def _phrase(name: str, result_json: str) -> str:
     return f"{server}/{tool} returned: {result_json}"
 
 
-def _fallback_intent(message: str, servers: list[str] | None) -> tuple[str, str, dict] | None:
-    """Map a demo prompt straight to a tool call.
+def _fallback_intents(message: str, servers: list[str] | None) -> list[tuple[str, str, dict]]:
+    """Every tool the prompt maps to, in a sensible order.
 
     Nova Micro cannot reliably emit multi-argument tool calls — it either produces
     an invalid tool-use sequence (Bedrock 424) or just answers in prose. When it
-    fails to call a tool the user plainly asked for, the orchestrator invokes the
-    obvious one itself. The call still goes through TrueFoundry and Reva, so the
+    fails to call the tools the user plainly asked for, the orchestrator invokes
+    them itself. The calls still go through TrueFoundry and Reva, so the
     authorization is exactly as real; only the tool *selection* stopped depending
-    on a model that can't do it. Scoped to servers that are switched on.
+    on a model that can't do it.
+
+    Returns a LIST, not a single match — a compound prompt ("get the billing
+    report, then open a ticket") must fire BOTH tools so the agent-to-agent chain
+    (billing agent -> ticketing sub-agent -> its own model call) actually runs.
+    Scoped to servers that are switched on.
     """
     m = message.lower()
     allowed = set(servers if servers is not None else SERVERS)
@@ -140,32 +149,41 @@ def _fallback_intent(message: str, servers: list[str] | None) -> tuple[str, str,
     def on(s: str) -> bool:
         return s in allowed
 
+    out: list[tuple[str, str, dict]] = []
     if on("billing-mcp") and ("pii" in m or "personal" in m):
-        return "billing-mcp", "get_customer_pii", {"customer_id": customer}
+        out.append(("billing-mcp", "get_customer_pii", {"customer_id": customer}))
     if on("billing-mcp") and "compliance" in m:
-        return "billing-mcp", "get_compliance_status", {"customer_id": customer}
+        out.append(("billing-mcp", "get_compliance_status", {"customer_id": customer}))
     if on("billing-mcp") and ("billing" in m or "report" in m or "invoice" in m):
-        return "billing-mcp", "get_billing_report", {"customer_id": customer}
+        out.append(("billing-mcp", "get_billing_report", {"customer_id": customer}))
     if on("external-mcp") and ("probe" in m or "analytics" in m or "external" in m):
-        return "external-mcp", "analytics_probe", {"query": message}
+        out.append(("external-mcp", "analytics_probe", {"query": message}))
     if on("ticketing-agent") and "ticket" in m:
-        return "ticketing-agent", "create_ticket", {"customer_id": customer, "summary": message}
+        out.append(("ticketing-agent", "create_ticket", {"customer_id": customer, "summary": message}))
     if on("booking-agent") and ("book" in m or "appointment" in m or "slot" in m):
-        return "booking-agent", "book_slot", {"customer_id": customer, "slot": "2026-07-14T10:00Z"}
-    return None
+        out.append(("booking-agent", "book_slot", {"customer_id": customer, "slot": "2026-07-14T10:00Z"}))
+    return out
 
 
 async def _run_fallback(
     message: str, servers: list[str] | None, emit: Callable[[dict], None],
     *, agent_id: str | None = None, user: str | None = None,
+    traceparent: str | None = None,
 ) -> str | None:
-    """If the prompt maps to a tool, call it directly and phrase the outcome."""
-    intent = _fallback_intent(message, servers)
-    if not intent:
+    """Run EVERY tool the prompt maps to, in order, and phrase each outcome.
+
+    Running all matches (not just the first) is what makes a compound prompt
+    exercise the A2A chain: get_billing_report AND create_ticket, the latter
+    delegating to the ticketing sub-agent."""
+    intents = _fallback_intents(message, servers)
+    if not intents:
         return None
-    server, tool, args = intent
-    result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user)
-    return _phrase(f"{server}__{tool}", result)
+    replies: list[str] = []
+    for server, tool, args in intents:
+        result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user,
+                                 traceparent=traceparent)
+        replies.append(_phrase(f"{server}__{tool}", result))
+    return "\n".join(replies)
 
 
 async def orchestrate(
@@ -178,6 +196,7 @@ async def orchestrate(
     servers: list[str] | None = None,
     history: list[dict[str, Any]] | None = None,
     max_turns: int = 6,
+    traceparent: str | None = None,
 ) -> str:
     """Run the agent loop for one user message. `emit` streams trace events to the UI.
 
@@ -189,7 +208,15 @@ async def orchestrate(
     max_turns bounds the loop: a model that keeps calling denied tools would
     otherwise retry forever, and each retry is a real authorization request.
     """
-    tools = await _available_tools(emit, servers, agent_id=agent_id, user=user)
+    # One W3C trace id for the whole turn: mint it once (or reuse an ingress one the
+    # caller forwarded), emit it to the UI, then forward it on every LLM + MCP hop so
+    # all of this turn's calls land in the PDP logs under the same trace.
+    if not traceparent:
+        traceparent = gateway.mint_traceparent()
+    emit({"type": "trace", "traceparent": traceparent})
+
+    tools = await _available_tools(emit, servers, agent_id=agent_id, user=user,
+                                   traceparent=traceparent)
     used_model = model or gateway.TFY_MODEL
     # Nova can't do OpenAI-style tool-calling: handing it `tools` makes the gateway
     # return 424 (failed dependency) on the malformed tool_use block it emits, so the
@@ -213,7 +240,8 @@ async def orchestrate(
     del max_turns  # single turn: Nova Micro can't sustain a multi-turn tool loop
     try:
         response = await gateway.chat(
-            messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model
+            messages, agent_id=agent_id, tools=send_tools or None, user=user, model=model,
+            traceparent=traceparent,
         )
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
@@ -226,7 +254,8 @@ async def orchestrate(
         # produces an invalid tool-use sequence). Show the model as allowed, then
         # fall back to invoking the tool the user clearly wanted.
         emit({"type": "allowed", "kind": "model", "server": agent_id, "tool": used_model})
-        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
+                                 traceparent=traceparent)
         if fb is not None:
             return fb
         # Nova failed and nothing maps to an enabled tool (e.g. a billing question
@@ -244,7 +273,8 @@ async def orchestrate(
     # Nova answered in prose without calling a tool. If the prompt plainly maps to
     # one, run it anyway so the demo beat still lands; otherwise return the text.
     if not choice.tool_calls:
-        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user)
+        fb = await _run_fallback(message, servers, emit, agent_id=agent_id, user=user,
+                                 traceparent=traceparent)
         return fb if fb is not None else (_strip_thinking(choice.content) or "…")
 
     # Nova called the tool itself — run each and report the outcome deterministically
@@ -253,7 +283,7 @@ async def orchestrate(
         _phrase(
             tc.function.name,
             await _run_tool(tc.function.name, json.loads(tc.function.arguments or "{}"), emit,
-                            agent_id=agent_id, user=user),
+                            agent_id=agent_id, user=user, traceparent=traceparent),
         )
         for tc in choice.tool_calls
     ]

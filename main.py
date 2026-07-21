@@ -132,20 +132,23 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest) -> StreamingResponse:
+async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     """Server-sent events: trace events as they happen, then the final reply.
 
     The orchestrator loop runs as a task while events drain from a queue, so a
     slow tool call doesn't hold the trace back — the denial lands in real time.
     """
     queue: asyncio.Queue = asyncio.Queue()
+    # Reuse a W3C traceparent if the caller already started a trace; otherwise the
+    # orchestrator mints one for this turn. Either way every hop shares one trace id.
+    ingress_traceparent = request.headers.get("traceparent")
 
     async def run() -> None:
         try:
             reply = await agents.orchestrate(
                 req.message, user=req.user, agent_id=req.agent_id,
                 model=req.model, servers=req.servers, history=req.history,
-                emit=queue.put_nowait,
+                emit=queue.put_nowait, traceparent=ingress_traceparent,
             )
             queue.put_nowait({"type": "reply", "text": reply})
         except Exception as e:  # noqa: BLE001
@@ -255,7 +258,10 @@ async def authorize(body: InputGuardrailRequest, request: Request) -> ValidateGu
             eval_request, _user_id = authorizer.build_model_eval(
                 body.requestBody, context, cfg
             )
-        decision = await authorizer.evaluate(eval_request, cfg)
+        # Forward TrueFoundry's W3C traceparent to the PDP (Amit): same trace across the session.
+        decision = await authorizer.evaluate(
+            eval_request, cfg, incoming_traceparent=request.headers.get("traceparent")
+        )
     except Exception as e:  # noqa: BLE001 — a plugin bug must not 500 the gateway
         _log("WARN", f"unexpected error in /reva/authorize: {type(e).__name__}: {e}")
         allow = cfg.fail_mode == "open"
