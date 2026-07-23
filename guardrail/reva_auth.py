@@ -130,6 +130,12 @@ class RevaConfig:
         # separate invokeAgent check, not this hot-path model call.)
         self.agent_id = pick("reva_agent_id", "REVA_AGENT_ID", "")
         self.environment = pick("reva_environment", "REVA_ENVIRONMENT", "")
+        # Which AI gateway produced this eval (truefoundry / kong / litellm).
+        # Multiple gateways can share one policy store, so we stamp the gateway
+        # into every eval's context AND the gateway-side decision log, so a
+        # decision can be traced back to the gateway that made it. (The Reva
+        # Decision Logs UI does not yet surface this field; correlate by trace.)
+        self.gateway_id = pick("reva_gateway_id", "REVA_GATEWAY_ID", "truefoundry")
 
         try:
             self.timeout_s = float(cfg.get("reva_pdp_timeout") or os.getenv("REVA_PDP_TIMEOUT", "5.0"))
@@ -353,7 +359,12 @@ class RevaAuthorizer:
     def _ai_context(self, user_id: str, meta: dict[str, Any]) -> dict[str, Any]:
         ctx: dict[str, Any] = {
             "onBehalfOf": self._on_behalf_of(user_id, meta),
-            "environment": {"requestId": uuid.uuid4().hex, "time": self._iso_now()},
+            # `gateway` tags which AI gateway forwarded this eval, so evals from
+            # TF / Kong / LiteLLM sharing one policy store can be told apart. The
+            # PDP receives it now (forward-compatible with future decision-log
+            # display); today it is correlated via the gateway-side log + trace.
+            "environment": {"requestId": uuid.uuid4().hex, "time": self._iso_now(),
+                            "gateway": os.getenv("REVA_GATEWAY_ID", "truefoundry")},
         }
         # Break-glass token + any guardrail signals the agent forwarded.
         approval = meta.get("approval_token") or meta.get("approvalToken")
@@ -755,5 +766,13 @@ class RevaAuthorizer:
                 for p in determining
                 if isinstance(p, dict)
             )
-        _log("INFO", f"decision={'allow' if allow else 'deny'} reason={reason!r} trace={trace_id}")
+        # Gateway-side correlation line: stamps WHICH gateway made this eval next
+        # to the action + trace id, so a decision in the shared Reva store can be
+        # traced to its source gateway by matching trace_id, even though the
+        # Decision Logs UI does not (yet) show a gateway column.
+        _act = eval_request.get("action")
+        _action_id = _act.get("id") if isinstance(_act, dict) else _act
+        _log("INFO",
+             f"[reva-tf] gateway={cfg.gateway_id} action={_action_id} "
+             f"decision={'allow' if allow else 'deny'} reason={reason!r} trace={trace_id}")
         return Decision(allow, reason or ("allow" if allow else "deny"), trace_id)
