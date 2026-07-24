@@ -36,7 +36,7 @@ services:
       - key: REVA_PDP_TIMEOUT
         value: "5.0"
       - key: REVA_DEBUG
-        value: "0"
+        value: "1"
       # --- orchestrator config: this service also serves the chat UI (/, /chat),
       # whose agents.py routes calls through TrueFoundry via gateway.py ---
       - key: TFY_LLM_URL

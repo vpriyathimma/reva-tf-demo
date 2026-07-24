@@ -206,6 +206,17 @@ async def debug_payloads() -> JSONResponse:
     return JSONResponse(content={"count": len(_PAYLOAD_CAPTURE), "payloads": list(_PAYLOAD_CAPTURE)})
 
 
+@app.get("/debug/outbound")
+async def debug_outbound() -> JSONResponse:
+    """The subject/resource of the last eval we POSTed to the PDP — proves whether
+    origin/endpoint actually go out on the wire. Gated behind REVA_DEBUG."""
+    if os.getenv("REVA_DEBUG", "0") != "1":
+        return JSONResponse(status_code=404,
+                            content={"detail": "set REVA_DEBUG=1 on the service to enable"})
+    from guardrail.reva_auth import _LAST_OUTBOUND
+    return JSONResponse(content={"last_outbound": list(_LAST_OUTBOUND)})
+
+
 def _mcp_tool_call(context: dict[str, Any], request_body: dict[str, Any]) -> tuple[str, Any] | None:
     """Detect an MCP tool invocation and return (qualified_tool_id, arguments).
 
