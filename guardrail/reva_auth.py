@@ -416,10 +416,24 @@ class RevaAuthorizer:
             out.append({
                 "seq": len(out) + 1,
                 "role": m.get("role"),
-                "content": str(c or "")[:4000],
+                "prompt": str(c or "")[:4000],    # enriched contract (2026-07: Amit) field name
+                "content": str(c or "")[:4000],   # kept for the console's chatHistory rendering
                 "timestamp": now,
+                "response": "",                   # enriched: per-message response (n/a from TF payload)
+                "thoughts": [],                   # enriched: per-message agent reasoning (n/a from TF)
             })
         return {"messages": out}
+
+    @staticmethod
+    def _thoughts(meta: dict[str, Any] | None) -> list[str]:
+        """Agent reasoning for the CURRENT hop → transmission.thoughts (enriched contract).
+        Agents may surface it via metadata.reva_thoughts (str or list); default empty."""
+        t = (meta or {}).get("reva_thoughts")
+        if isinstance(t, str) and t.strip():
+            return [t.strip()]
+        if isinstance(t, list):
+            return [str(x) for x in t if x]
+        return []
 
     # An orchestrator tool result reaches the model phrased as
     # "billing-mcp/get_billing_report returned: {...}" (see agents._phrase). That
@@ -517,7 +531,9 @@ class RevaAuthorizer:
                 "context": context,
                 "transmission": {"promptKey": "content", "role": "user",
                                  "contentType": "text/plain",
-                                 "content": self._extract_prompt(request_body)},
+                                 "content": self._extract_prompt(request_body),
+                                 "thoughts": self._thoughts(meta),  # enriched: agent's intent for this hop
+                                 "response": ""},                    # enriched: pre-call, no response yet
                 "session": self._session(meta, now, self._turn(messages)),
             }
             _log("INFO", f"[ai-eval] invokeModel agent={agent_id} model={model} user={user_id} "
@@ -620,7 +636,9 @@ class RevaAuthorizer:
                 "context": context,
                 "transmission": {"promptKey": "content", "role": "user",
                                  "contentType": "text/plain",
-                                 "content": str(arguments or "")[:2000]},
+                                 "content": str(arguments or "")[:2000],
+                                 "thoughts": self._thoughts(meta),  # enriched: agent's intent for this tool call
+                                 "response": ""},                    # enriched: pre-call, no response yet
                 "inputValues": arguments if isinstance(arguments, dict) else {},
                 "session": self._session(meta, now, turn),
             }
