@@ -75,16 +75,19 @@ async def _available_tools(
 async def _run_tool(name: str, arguments: dict, emit: Callable[[dict], None],
                     *, agent_id: str | None = None, user: str | None = None,
                     traceparent: str | None = None,
-                    conversation: list[dict[str, Any]] | None = None) -> str:
+                    conversation: list[dict[str, Any]] | None = None,
+                    thoughts: str | None = None) -> str:
     """Execute one tool call and return what the model should see as its result.
 
     `conversation` is the turn's history so far; forwarded so the tool-call eval
-    carries chatHistory + hops instead of an empty list."""
+    carries chatHistory + hops instead of an empty list. `thoughts` is the agent's
+    reasoning for this call → transmission.thoughts in the eval (intent detection)."""
     server, tool = name.split("__", 1)
     emit({"type": "tool_call", "server": server, "tool": tool, "arguments": arguments})
     try:
         result = await gateway.call_tool(server, tool, arguments, agent_id=agent_id, user=user,
-                                         traceparent=traceparent, conversation=conversation)
+                                         traceparent=traceparent, conversation=conversation,
+                                         thoughts=thoughts)
     except Exception as e:  # noqa: BLE001
         if _is_denial(e):
             emit({"type": "denied", "server": server, "tool": tool})
@@ -188,8 +191,15 @@ async def _run_fallback(
     # progressively, the same way LiteLLM's loop builds them.
     convo: list[dict[str, Any]] = [{"role": "user", "content": message}]
     for server, tool, args in intents:
+        # No live model reasoning here (this path runs when the model can't tool-call),
+        # so synthesize the agent's intent from the prompt + planned action. The user's
+        # own words ride along, so a prompt-injection/exfil ask is visible to the intent
+        # engine in transmission.thoughts.
+        thought = (f"To handle the user request {message!r}, I will call "
+                   f"{server}/{tool} with arguments {json.dumps(args, default=str)}.")
         result = await _run_tool(f"{server}__{tool}", args, emit, agent_id=agent_id, user=user,
-                                 traceparent=traceparent, conversation=list(convo))
+                                 traceparent=traceparent, conversation=list(convo),
+                                 thoughts=thought)
         replies.append(_phrase(f"{server}__{tool}", result))
         convo.append({"role": "tool", "content": f"{server}/{tool} returned: {result[:600]}"})
     return "\n".join(replies)
@@ -286,13 +296,18 @@ async def orchestrate(
                                  traceparent=traceparent)
         return fb if fb is not None else (_strip_thinking(choice.content) or "…")
 
-    # Nova called the tool itself — run each and report the outcome deterministically
+    # The model called the tool itself — run each and report the outcome deterministically
     # (no second model call: asking Nova to summarise a tool result is where it 424s).
+    # choice.content is the model's OWN reasoning next to the tool call (for gpt-4o it's
+    # the plan; for Nova the <thinking> block). Forward it as the tool call's thoughts so
+    # the intent engine sees the agent's real reasoning, not just the tool name/args.
+    reasoning = (choice.content or "").strip()
     replies = [
         _phrase(
             tc.function.name,
             await _run_tool(tc.function.name, json.loads(tc.function.arguments or "{}"), emit,
-                            agent_id=agent_id, user=user, traceparent=traceparent),
+                            agent_id=agent_id, user=user, traceparent=traceparent,
+                            thoughts=reasoning or None),
         )
         for tc in choice.tool_calls
     ]
