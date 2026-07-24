@@ -32,10 +32,6 @@ from typing import Any
 
 import httpx
 
-# DEBUG: the subject/resource of the most recent eval we POSTed to the PDP.
-# Exposed via main.py /debug/outbound (REVA_DEBUG=1) to prove what goes on the wire.
-_LAST_OUTBOUND: list = []
-
 
 # ---------------------------------------------------------------------------
 # Logging — straight to stderr so the container's log driver captures it
@@ -762,15 +758,6 @@ class RevaAuthorizer:
         # show `--data '{...}'` and a single-object response; the LiteLLM hook
         # posted a bare object too).
         body: Any = eval_request
-
-        # DEBUG capture: stash the subject/resource we're about to POST, so
-        # /debug/outbound can prove whether origin/endpoint go out on the wire.
-        try:
-            _LAST_OUTBOUND[:] = [{"action": eval_request.get("action"),
-                                  "subject": eval_request.get("subject"),
-                                  "resource": eval_request.get("resource")}]
-        except Exception:  # noqa: BLE001
-            pass
 
         t0 = time.perf_counter()
         try:
