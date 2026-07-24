@@ -697,6 +697,19 @@ class RevaAuthorizer:
             _log("WARN", "PDP not configured — allow-by-default")
             return Decision(True, "pdp not configured (allow-by-default)", trace_id)
 
+        # Enriched contract (2026-07, Amit): subject.origin (where the agent runs) and
+        # resource.endpoint (where the tool/model lives). Sent wherever applicable —
+        # env-configured; omitted when unset so nothing breaks.
+        origin = os.getenv("REVA_AGENT_ORIGIN", "").strip()
+        if origin and isinstance(eval_request.get("subject"), dict):
+            eval_request["subject"].setdefault("origin", origin)
+        res = eval_request.get("resource")
+        if isinstance(res, dict):
+            ep = (os.getenv("REVA_MODEL_ENDPOINT", "") if res.get("type") == "Model"
+                  else os.getenv("REVA_TOOL_ENDPOINT", "")).strip()
+            if ep:
+                res.setdefault("endpoint", ep)
+
         # Header shape differs by target. agent_v5 hits the AI Evaluation API,
         # which wants `Authorization: Bearer <token>` + policyStoreId +
         # x-ms-correlation-id (per docs.reva.ai Agent Authorization Evaluation
