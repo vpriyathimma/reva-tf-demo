@@ -45,6 +45,14 @@ services:
         value: https://gateway.truefoundry.ai/reva-demo/mcp
       - key: TFY_MODEL
         value: bedrock/amazon.nova-micro-v1-0
+      # --- enriched eval contract: subject.origin + resource.endpoint ---
+      # (blueprint-pinned; manual dashboard env vars get reset on each deploy)
+      - key: REVA_AGENT_ORIGIN
+        value: https://reva-tf-plugin.onrender.com
+      - key: REVA_MODEL_ENDPOINT
+        value: https://reva-demo.truefoundry.cloud/api/llm
+      - key: REVA_TOOL_ENDPOINT
+        value: https://gateway.truefoundry.ai/reva-demo/mcp
       # --- secrets: Render prompts for these on deploy; never commit them ---
       - key: REVA_PDP_URL
         sync: false
