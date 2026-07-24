@@ -700,13 +700,20 @@ class RevaAuthorizer:
         # Enriched contract (2026-07, Amit): subject.origin (where the agent runs) and
         # resource.endpoint (where the tool/model lives). Sent wherever applicable —
         # env-configured; omitted when unset so nothing breaks.
-        origin = os.getenv("REVA_AGENT_ORIGIN", "").strip()
-        if origin and isinstance(eval_request.get("subject"), dict):
+        # Prefer REVA_* env, but fall back to the TFY_* vars already proven in-process
+        # (the blueprint reliably ships those) + a sane default, so these never depend
+        # on a fresh env var actually syncing.
+        origin = os.getenv("REVA_AGENT_ORIGIN", "").strip() or "https://reva-tf-plugin.onrender.com"
+        if isinstance(eval_request.get("subject"), dict):
             eval_request["subject"].setdefault("origin", origin)
         res = eval_request.get("resource")
         if isinstance(res, dict):
-            ep = (os.getenv("REVA_MODEL_ENDPOINT", "") if res.get("type") == "Model"
-                  else os.getenv("REVA_TOOL_ENDPOINT", "")).strip()
+            if res.get("type") == "Model":
+                ep = (os.getenv("REVA_MODEL_ENDPOINT", "").strip()
+                      or os.getenv("TFY_LLM_URL", "").strip())
+            else:
+                ep = (os.getenv("REVA_TOOL_ENDPOINT", "").strip()
+                      or os.getenv("TFY_MCP_URL", "").strip())
             if ep:
                 res.setdefault("endpoint", ep)
 
